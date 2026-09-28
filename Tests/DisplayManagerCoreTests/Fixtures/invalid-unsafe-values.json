@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "44444444-4444-4444-8444-444444444444",
+      "name": "Injected",
+      "screens": [
+        {
+          "displayIDs": ["BBBB\"; rm -rf ~; echo \""],
+          "enabled": true,
+          "resolution": {"width": 3008, "height": 1692},
+          "origin": {"x": 0, "y": 0},
+          "extraArguments": {"quiet": "$(touch /tmp/pwned)"}
+        }
+      ]
+    },
+    {
+      "id": "55555555-5555-4555-8555-555555555555",
+      "name": "",
+      "screens": [
+        {
+          "displayIDs": ["AAAAAAAA-1111-2222-3333-444444444444"],
+          "enabled": true,
+          "resolution": {"width": 0, "height": 99999},
+          "refreshRate": 5000,
+          "rotation": 45,
+          "origin": {"x": 10, "y": 10}
+        }
+      ]
+    }
+  ],
+  "rules": [
+    {
+      "id": "66666666-6666-4666-8666-666666666666",
+      "profileID": "77777777-7777-4777-8777-777777777777"
+    }
+  ]
+}

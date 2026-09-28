@@ -1,0 +1,978 @@
+# DisplayManager: Implementation Plan
+
+Status: Phase 1 (planning) complete. Phase 2 starts only after the explicit instruction `Execute the plan`.
+
+This file is the source of truth for Phase 2. If implementation proves an assumption wrong, make the
+smallest reasonable adjustment and record it in section 26 ("Deviations log").
+
+---
+
+## 1. Environment findings (verified on this machine, 2026-09-29)
+
+| Item | Finding |
+|---|---|
+| Hardware | MacBook Pro, Mac16,8, Apple M4 Pro, arm64 |
+| macOS | 27.0 (26A428) |
+| Xcode | 27.0 installed, **license not accepted**, so `xcodebuild` and the `/usr/bin/swift` shim fail |
+| Command Line Tools | `/Library/Developer/CommandLineTools`, Swift 6.4, **works without the Xcode license**, ships `Testing.framework` (Swift Testing) |
+| SDKs | MacOSX27.0.sdk (Xcode and CLT) |
+| displayplacer | v1.4.0 at `/opt/homebrew/bin/displayplacer` (symlink into Cellar). Not in `/usr/local/bin` |
+| `displayplacer list` | ~60 ms. Output format v1.4.0 (sample in section 9.2) |
+| displayplacer errors | Unknown screen id: exit 1, stderr/stdout `Unable to find screen <id> - skipping changes for that screen` (printed several times). Bad syntax: exit 1, `Argument parsing error`. Probed only with an all-zero dummy id, so no display state changed |
+| Repo | Empty directory, not a git repository, located inside iCloud Drive |
+| Linters | No `shellcheck`, `swiftlint`, `swift-format` installed |
+| Connected now | Built-in display (main) + external "Mi Monitor" (EDID manufacturer `XMI`) via USB-C |
+
+### 1.1 Port topology evidence (key result)
+
+IORegistry on this Mac exposes one `IOPortTransportStateDisplayPort` node per active DisplayPort sink.
+It sits directly under the physical port controller node (`AppleHPMInterfaceType10`, name `Port-USB-C`, location `@3`):
+
+```
+hpm2@C (AppleARMSPMIDevice)
+ └─ AppleHPMDeviceHALType3@C
+     └─ Port-USB-C@3            <AppleHPMInterfaceType10>  PortNumber=3, TransportsActive=(CC, USB2, DisplayPort)
+         └─ DisplayPort         <IOPortTransportStateDisplayPort>
+              TransportDescription      = "Port-USB-C@3/DisplayPort"
+              ParentBuiltInPortType     = 2 ("USB-C")      (HDMI = 6)
+              ParentBuiltInPortNumber   = 3
+              ParentPortBuiltIn         = Yes
+              Tunneled                  = No               (DP Alt Mode, not a Thunderbolt tunnel)
+              Active = Yes, HPD_State = 2 ("High"), SinkCount = 1, LinkRate "8.1 Gbps (HBR3)"
+              EDID = <00ffffffffffff0061a9a127 13000000 ...>
+              ProductName = "Mi Monitor", ManufacturerName = "XMI", ProductID = 10145, SerialNumber = 19
+```
+
+- There are three USB-C HPM ports (`Port-USB-C@1/2/3`), one HDMI port (`Port-HDMI@1`, its DP transport node is
+  persistent with `Active = No` when nothing is connected), and MagSafe.
+- `system_profiler SPThunderboltDataType` reports Thunderbolt buses with `Receptacle: 1/2/3`, and
+  `IOThunderboltPort` has `Socket ID` "1"/"2"/"3". macOS numbers the same physical receptacles consistently
+  across HPM, Thunderbolt and DisplayPort transport nodes.
+- `ConnectionUUID` on HPM ports differs per port and per connection (name and values suggest a per-plug id). **Not used.**
+- The DCP (display coprocessor) that drives the display (`dispext0`/`dispext1`) is routed through a crossbar
+  (`AppleT604XATCDPXBAR`). DCP index is **not** a port identifier. **Not used.**
+
+### 1.2 CoreGraphics ↔ IORegistry ↔ displayplacer join (verified with a read-only probe script in the scratchpad)
+
+| Source | Built-in | Mi Monitor |
+|---|---|---|
+| `CGDirectDisplayID` | 1 | 3 |
+| displayplacer "Contextual screen id" | 1 | 3 |
+| `CGDisplayCreateUUIDFromDisplayID` | 37D8832A-… | 1D8D03AE-… |
+| displayplacer "Persistent screen id" | 37D8832A-… | 1D8D03AE-… |
+| `CGDisplaySerialNumber` | 42…(10 digits) | 19 |
+| displayplacer "Serial screen id" | s42…(10 digits) | s19 |
+| `CGDisplayVendorNumber` / `CGDisplayModelNumber` | 0x0610 / 0xA061 | 0x61A9 / 0x27A1 |
+| EDID bytes 8–15 in DP transport (vendor BE / product LE / serial LE) | n/a (internal panel) | 0x61A9 / 0x27A1 / 19 |
+| `CGDisplayBounds` | (0,0,1800,1169) | (-592,-1692,3008,1692) |
+| displayplacer origin/res | (0,0) 1800x1169 | (-592,-1692) 3008x1692 |
+
+Conclusion: an external display is linked to its physical port by matching
+`(CGDisplayVendorNumber, CGDisplayModelNumber, CGDisplaySerialNumber)` with the EDID decoded from the
+`IOPortTransportStateDisplayPort` node. The port is `ParentBuiltInPortType` + `ParentBuiltInPortNumber`.
+
+### 1.3 Other verified APIs (macOS 27 SDK headers)
+
+- `SMAppService.mainApp`, `.status` (`.enabled/.requiresApproval/.notRegistered/.notFound`), `register()`,
+  `unregister()`, `SMAppService.openSystemSettingsLoginItems()`: macOS 13+.
+- `NSMenuItem.sectionHeader(title:)`: macOS 14. `NSMenuItem.subtitle`: macOS 14.4. `NSApp.activate()`: macOS 14.
+- Carbon `RegisterEventHotKey`, `UnregisterEventHotKey`, `CopySymbolicHotKeys`, option `kEventHotKeyExclusive`,
+  error `eventHotKeyExistsErr` exist in HIToolbox (headers need `grep -a`).
+- `CGDisplayRegisterReconfigurationCallback`, `CGGetOnlineDisplayList`, `CGDisplayIsBuiltin`, vendor/model/serial.
+- Displays settings extension bundle id: `com.apple.Displays-Settings.extension`
+  (`/System/Library/ExtensionKit/Extensions/DisplaysExt.appex`). System Settings registers URL scheme
+  `x-apple.systempreferences`. Legacy `/System/Library/PreferencePanes/Displays.prefPane` still exists.
+- SF Symbols present: `display`, `display.2`, `display.trianglebadge.exclamationmark`.
+
+---
+
+## 2. Product decisions
+
+| Decision | Choice | Reason |
+|---|---|---|
+| Product name | **DisplayManager** (repo folder name) | Respect existing name |
+| Installed app | `/Applications/DisplayManager.app` | Requirement |
+| Bundle id | `com.bachana.DisplayManager` (single variable in build script) | Assumption; changing later resets preferences and login item |
+| Minimum macOS | **14.0 Sonoma** | `@Observable`, `NSApp.activate()`, `NSMenuItem.sectionHeader`, SMAppService (13) |
+| Dock icon | None. `LSUIElement = true` (accessory app) | Menu bar utility |
+| Architecture | Native arm64 build only (the host arch) | Universal builds need Xcode's build system |
+| Language | Swift 6 language mode, strict concurrency | Correctness |
+| UI | AppKit lifecycle + SwiftUI views hosted in `NSHostingController` | See 4.2 |
+| Third-party deps | None | Requirement |
+| Sandbox | **Off** (required: must exec `displayplacer` and read IORegistry) | Local distribution |
+| Hardened runtime | On (harmless; keeps notarization possible later) | |
+| Signing | Ad-hoc (`codesign --sign -`) | No paid developer account needed |
+| Defaults | Auto Apply ON, Reapply After Wake ON, Launch at Login OFF (user opts in), no shortcuts assigned | Safe defaults; rules must exist before anything auto-applies |
+
+---
+
+## 3. Build system decision
+
+**Swift Package Manager + Command Line Tools, with a script that assembles the `.app` bundle.**
+
+| Option | Effect |
+|---|---|
+| Xcode project + `xcodebuild` | Needs Xcode license acceptance (`sudo`), hand-written `project.pbxproj`, hosted unit tests would launch the real menu bar app |
+| **SwiftPM + bundle script** | Works today with CLT, diffable text-only config, `swift test` runs core tests hostless (no risk of touching real displays), opens fine in Xcode via `Package.swift` |
+
+- `swift build -c release --product DisplayManager --scratch-path <build dir>`.
+- `Scripts/build-app.sh` builds and assembles:
+  `DisplayManager.app/Contents/{MacOS/DisplayManager, Info.plist, PkgInfo, Resources/AppIcon.icns}`,
+  stamps version into Info.plist, runs `plutil -lint`, ad-hoc signs, `codesign --verify --strict`.
+- Build directory defaults to `~/Library/Caches/DisplayManager-build` (overridable with `DM_BUILD_DIR`).
+  Keeps build products out of the iCloud Drive repo.
+- Toolchain selection in scripts: use `xcrun swift` if it works. If it fails (for example the license error) and
+  CLT exists, export `DEVELOPER_DIR=/Library/Developer/CommandLineTools` for the script process only.
+  No system changes, no `sudo`.
+- App icon: `Scripts/generate-icon.swift` draws a simple original icon (two monitor shapes) with CoreGraphics,
+  then `sips` + `iconutil` produce `Packaging/AppIcon.icns`. Generated once and committed.
+  SF Symbols are not used for the app icon (their license forbids icons/logos). The menu bar uses the
+  `display` SF Symbol, which is allowed UI use.
+
+---
+
+## 4. Architecture
+
+### 4.1 Layers
+
+```
+┌──────────────── DisplayManager (executable: AppKit, SwiftUI, IOKit, CoreGraphics, Carbon, ServiceManagement) ─────────────┐
+│ AppDelegate → AppModel (@MainActor @Observable, the single UI state)                                                        │
+│   StatusItemController ─ left click: NSMenu      right click / ctrl-click: System Settings › Displays                        │
+│   WindowCoordinator ─ Layout Manager window, Settings window (NSWindow + NSHostingController)                                │
+│   AutomationCoordinator ─ events → debounce → stable snapshot → decide (Core) → ApplyCoordinator                             │
+│   ApplyCoordinator ─ serial queue of apply requests, uses Core.LayoutApplier                                                 │
+│   ProfileStore (JSON file) · Preferences (UserDefaults) · DiagnosticsLog (os.Logger + ring buffer)                           │
+│   System adapters: DisplayplacerClient (Process) · CGDisplayReader · PortTopologyReader (IOKit) · SnapshotService            │
+│                    DisplayEventMonitor · LoginItemController · HotKeyCenter · SystemSettingsOpener                           │
+└───────────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────┘
+                                                │ Sendable value types only
+┌───────────────────────────────── DisplayManagerCore (library, Foundation only, unit-tested) ──────────────────────────────────┐
+│ Models · ScreenSpecCodec · ListOutputParser · CommandBuilder · ExecutableLocator · ApplyOutcome classifier                    │
+│ EDID · PortTransportRecord · SnapshotAssembler (join) · DisplayResolver · LayoutComparator · RuleMatcher                     │
+│ AutomationPolicy (trigger decision, loop guard, circuit breaker) · LayoutApplier (bounded retry + verify, protocol-driven)     │
+│ LayoutDocument (versioned) · Migrator · ImportValidator/Merger · ShortcutValidator · PreviewGeometry · DisplayManagerError    │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Rules:
+- Core has no AppKit, IOKit, CoreGraphics or Process calls. Hardware readers produce plain records that Core consumes.
+- Only two small protocols exist for testability: `DisplayControl` (list + apply) and `Sleeper` (injectable delay)
+  used by `LayoutApplier`. No other DI layers.
+- All models are `Codable, Hashable, Sendable` structs.
+
+### 4.2 Why AppKit lifecycle instead of SwiftUI `App`/`MenuBarExtra`
+
+- `MenuBarExtra` cannot distinguish left and right clicks.
+- Opening the SwiftUI `Settings` scene from AppKit code is unreliable on macOS 14+ (`showSettingsWindow:` is
+  deprecated; `openSettings` needs a SwiftUI view context and hidden-window workarounds).
+- AppKit lifecycle (`main.swift` → `NSApplication` + `AppDelegate`) gives full control over `NSStatusItem`,
+  window activation and ordering. SwiftUI is still used for all window content.
+- A minimal `NSApp.mainMenu` (App: About, Settings… ⌘,, Quit ⌘Q; Edit: Undo/Redo/Cut/Copy/Paste/Select All;
+  Window: Close ⌘W, Minimize ⌘M) is installed so text fields support copy/paste and ⌘W works in an accessory app.
+
+### 4.3 Concurrency
+
+- UI state and coordinators: `@MainActor`.
+- `DisplayplacerClient`: runs `Process` off the main actor; stdout and stderr are drained concurrently to avoid
+  pipe deadlock; timeout 20 s → `terminate()`, then `SIGKILL` after 2 s.
+- C callbacks (CG reconfiguration, IOKit notifications, Carbon hotkeys) receive an `Unmanaged` context and hop to
+  the main actor with `Task { @MainActor in … }`. No `assumeIsolated` on callback paths.
+- Apply requests are serialized: one apply at a time; a newer request replaces any queued request; a running
+  `displayplacer` process is never killed mid-apply (except timeout).
+
+---
+
+## 5. File and module structure
+
+```
+DisplayManager/
+├── .plan                         this file
+├── .gitignore                    .build/, .build.nosync/, .swiftpm/, DerivedData/, dist/, *.xcuserstate, xcuserdata/
+├── README.md                     usage, build, install, logs, limitations
+├── install.sh
+├── Package.swift                 tools 6.0; platforms [.macOS(.v14)]; products: executable DisplayManager
+├── Packaging/
+│   ├── Info.plist                template (bundle id, version placeholders, LSUIElement, LSMinimumSystemVersion 14.0)
+│   └── AppIcon.icns              generated once by Scripts/generate-icon.swift
+├── Scripts/
+│   ├── build-app.sh              build + assemble + sign + verify; used by install.sh and for development
+│   └── generate-icon.swift
+├── Sources/
+│   ├── DisplayManagerCore/
+│   │   ├── Model/                ScreenSetting, DisplayInfo, LayoutProfile, AutoApplyRule, ConnectionFingerprint
+│   │   │                         (+ KnownPort), KeyShortcut, SystemSnapshot (LiveDisplay, ParsedList, TopologySignature)
+│   │   ├── Displayplacer/        ScreenSpecCodec, ListOutputParser, CommandBuilder, ExecutableLocator, ApplyOutcome
+│   │   ├── Topology/             EDID, PortTransportRecord, SnapshotAssembler
+│   │   ├── Matching/             DisplayResolver, LayoutComparator, RuleMatcher
+│   │   ├── Automation/           AutomationPolicy, LayoutApplier
+│   │   ├── Persistence/          LayoutDocument (+ migration), ImportValidator (+ merge)
+│   │   └── Support/              ShortcutValidator, PreviewGeometry, DisplayManagerError
+│   └── DisplayManager/
+│       ├── main.swift, AppDelegate.swift, AppModel.swift, MainMenu.swift
+│       ├── MenuBar/              StatusItemController, StatusMenuBuilder
+│       ├── System/               DisplayplacerClient, CGDisplayReader, PortTopologyReader, SnapshotService,
+│       │                         DisplayEventMonitor, LoginItemController, HotKeyCenter, SystemSettingsOpener, DiagnosticsLog
+│       ├── Services/             ProfileStore, Preferences, ApplyCoordinator, AutomationCoordinator
+│       └── UI/
+│           ├── WindowCoordinator, SaveLayoutPrompt, Alerts
+│           ├── LayoutManager/    LayoutManagerView, ProfileDetailView, CurrentDisplaysView, AutoApplyRuleEditor,
+│           │                     RawCommandView, LayoutPreviewView
+│           ├── Settings/         SettingsWindowController, General, Automation, Displayplacer, Data views
+│           └── Components/       ShortcutRecorder (NSViewRepresentable)
+└── Tests/DisplayManagerCoreTests/
+    ├── Fixtures/                 real list output from this Mac (ids anonymized) + clearly labeled synthetic variants
+    │                             (mirrored, disabled, clamshell, three displays), layouts-v1.json, invalid-*.json
+    └── *Tests.swift              Swift Testing (`import Testing`)
+```
+
+---
+
+## 6. macOS APIs
+
+| Need | API |
+|---|---|
+| Menu bar item | `NSStatusBar.system.statusItem(withLength: .squareLength)`, `NSStatusBarButton`, `sendAction(on: [.leftMouseDown, .rightMouseDown])`, `NSMenu` + `NSMenuDelegate` |
+| Icon | `NSImage(systemSymbolName: "display")`, `isTemplate = true`; error state `display.trianglebadge.exclamationmark` |
+| Windows | `NSWindow`, `NSHostingController`, `NSTabViewController(tabStyle: .toolbar)` for Settings, `NSApp.activate()` |
+| Save prompt, errors | `NSAlert` with accessory view |
+| Import/export | `NSOpenPanel`, `NSSavePanel`, `UTType.json` |
+| Live displays | `CGGetOnlineDisplayList`, `CGDisplayIsBuiltin`, `CGDisplayIsMain`, `CGDisplayVendorNumber`, `CGDisplayModelNumber`, `CGDisplaySerialNumber`, `CGDisplayBounds`, `CGDisplayRotation`, `CGDisplayCopyDisplayMode`, `CGDisplayCreateUUIDFromDisplayID`, `NSScreen.localizedName` (via `NSScreenNumber`) |
+| Display events | `CGDisplayRegisterReconfigurationCallback`, `NSApplication.didChangeScreenParametersNotification` (secondary) |
+| Port topology | IOKit: `IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOPortTransportStateDisplayPort"))`, `IORegistryEntryCreateCFProperties`, `IORegistryEntryGetParentEntry(kIOServicePlane)`, `IORegistryEntryGetName`, `IORegistryEntryGetLocationInPlane`; notifications `IONotificationPortCreate`, `IONotificationPortSetDispatchQueue(.main)`, `IOServiceAddMatchingNotification` (`kIOFirstMatchNotification`, `kIOTerminatedNotification`) |
+| Host model | `sysctlbyname("hw.model")` |
+| Sleep/wake/session | `NSWorkspace.shared.notificationCenter`: `willSleepNotification`, `didWakeNotification`, `screensDidWakeNotification`, `sessionDidResignActiveNotification`, `sessionDidBecomeActiveNotification` |
+| Run displayplacer | `Process` (`executableURL`, `arguments`), `Pipe` |
+| Launch at Login | `SMAppService.mainApp` |
+| Global shortcuts | Carbon `RegisterEventHotKey`, `InstallEventHandler(GetApplicationEventTarget(), …kEventHotKeyPressed…)`, `CopySymbolicHotKeys` |
+| Open Displays settings | `NSWorkspace.shared.open(URL)`, `NSWorkspace.shared.openApplication(at:configuration:)` |
+| Logging | `os.Logger` |
+| Persistence | `JSONEncoder/Decoder` (`.iso8601`, sorted keys, pretty), `Data.write(options: .atomic)`, `UserDefaults` |
+
+---
+
+## 7. Display detection strategy
+
+`SnapshotService.capture() async throws -> SystemSnapshot` builds one consistent view:
+
+1. **CoreGraphics records** (fast, synchronous): for each online display: `CGDirectDisplayID`, UUID string,
+   builtin, main, vendor, model, serial, bounds, rotation, localized name.
+2. **Port transport records** (IOKit, synchronous, a few ms): every `IOPortTransportStateDisplayPort` node →
+   `PortTransportRecord { transportDescription, portType, portTypeDescription, builtInPortNumber, portBuiltIn,
+   tunneled, active, hpdHigh, sinkCount, edid: Data?, parentName, parentLocation }`.
+   Missing class or read failure → empty list + `topologyStatus = .unavailable(reason)` (non-fatal).
+3. **displayplacer list** (subprocess ~60 ms) → `ParsedList` (screens + authoritative command, section 9.2).
+4. **Join (Core `SnapshotAssembler`)**:
+   - displayplacer screen ↔ CG record by persistent UUID (fallback: contextual id == `CGDirectDisplayID`).
+   - External CG record ↔ transport by EDID triple (vendor, product, serial) among transports with
+     `active || hpdHigh`. Exactly one candidate → identified. Zero → `.unidentified(.noTransport)`.
+     Several (identical monitors, same serial) → `.unidentified(.ambiguous)`.
+   - Built-in → `.builtIn`.
+5. Result: `SystemSnapshot { displays: [LiveDisplay], parsedList, topologyStatus, hostModel, capturedAt }`
+   and a `TopologySignature` = sorted `[(persistentID, connectionKey)]` where connectionKey is the fingerprint key,
+   `builtin` or `unidentified`. The signature ignores modes, origins and rotation on purpose.
+
+If displayplacer is missing, steps 1–2 still run, so the Manager can show connected displays and ports,
+but "Current Layout" shows `Unknown` and apply/save are disabled with a clear reason.
+
+The snapshot is cached in `AppModel` and refreshed after debounced display events, after every apply, on app launch,
+and when the Layout Manager opens. Opening the status menu uses the cache (no subprocess on menu open).
+
+---
+
+## 8. Physical Thunderbolt / USB-C port detection
+
+### 8.1 Fingerprint
+
+```swift
+struct ConnectionFingerprint: Codable, Hashable, Sendable {
+    var hostModel: String          // "Mac16,8": port numbers are only meaningful on the same Mac model
+    var portType: PortKind         // .usbC (2), .hdmi (6), .other(Int)  ← ParentBuiltInPortType
+    var portNumber: Int            // ParentBuiltInPortNumber (== HPM PortNumber == Thunderbolt receptacle)
+    var tunneled: Bool             // DP tunneled through Thunderbolt/USB4 (dock) vs DP Alt Mode / native HDMI
+    var key: String { "\(hostModel)/\(portType.rawKey)@\(portNumber)\(tunneled ? "/tunnel" : "")" }
+}
+```
+
+- Matching is plain equality of the key. Deterministic, no fuzzy logic.
+- Stored separately from monitor identity. Rules combine both (section 14).
+- Diagnostic-only extras (not part of equality): `transportDescription`, link rate, lane count, parent name/location.
+- Not used, by design: display persistent UUID (same on every port), `CGDirectDisplayID`/contextual id
+  (documented by displayplacer as changing, but not reliably port-bound), `ConnectionUUID` (per plug),
+  DCP index (crossbar-routed).
+
+Fallback derivation order for `portType`/`portNumber` if a property is missing on a future macOS:
+1. `ParentBuiltInPortType` + `ParentBuiltInPortNumber` on the transport node.
+2. `ParentPortType` + `ParentPortNumber` when `ParentPortBuiltIn == Yes`.
+3. Walk `IORegistryEntryGetParentEntry` (IOService plane) to the nearest `AppleHPMInterfaceType*` ancestor and read
+   `PortType` + `PortNumber`.
+4. Otherwise `.unidentified(.noPortInfo)`.
+
+### 8.2 Labels (never invented)
+
+- UI label comes from macOS's own naming: `USB-C Port 3`, `HDMI Port`, plus ` (Thunderbolt)` when tunneled.
+  This matches `Port-USB-C@3` in IORegistry and `Receptacle: 3` in System Information.
+- The app never says "left" or "right". The user can give each learned port a custom name ("Desk Port").
+  Names are stored in `knownPorts` and reused everywhere the same fingerprint appears.
+
+### 8.3 Learn Current Port
+
+In the profile's rule editor:
+1. User connects the monitor to the wanted port, clicks **Learn Current Port**.
+2. App captures a fresh snapshot, finds the profile's external display(s) among connected displays
+   (via `DisplayResolver`), reads each one's fingerprint.
+3. Success → requirement saved, shows `Mi Monitor via USB-C Port 3` + optional name field.
+4. Errors: monitor not connected ("Connect Mi Monitor to the port you want, then try again."), port unidentified
+   ("macOS did not report which port this display uses."), ambiguous identical monitors.
+5. `Save Current Layout…` also records each external display's current fingerprint as profile metadata
+   (`DisplayInfo.connection`), so the rule editor can offer "Use port from when this layout was saved".
+
+### 8.4 Unverified cases (handled defensively)
+
+- Thunderbolt dock / USB4 hub (tunneled DP): expected `Tunneled = Yes` with the root port number. Not verifiable here.
+- MST daisy chain / dock with 2 displays on one port: one transport may carry `SinkCount > 1` with a single EDID →
+  the second display is `.unidentified`. Rules without port requirements still work.
+- Intel Macs or macOS versions without `IOPortTransportStateDisplayPort`: port detection reports
+  "not available on this Mac"; identity-only rules still work.
+
+---
+
+## 9. displayplacer integration
+
+### 9.1 Discovery (`ExecutableLocator`, pure logic with injected `isExecutable`)
+
+Order (first executable wins, symlinks resolved for display):
+1. User override path from Settings (`Choose…`), if set and executable.
+2. `/opt/homebrew/bin/displayplacer`
+3. `/usr/local/bin/displayplacer`
+4. Each directory in the process `PATH` (launchd gives GUI apps a minimal PATH), plus
+   `~/.local/bin`, `~/bin`, `/opt/local/bin` (MacPorts).
+
+No login-shell execution (it runs user rc files). Version: `displayplacer --version` → parse `displayplacer v1.4.0`.
+Minimum supported: **1.4.0** (list format changed in 1.4.0). Older → "Unsupported displayplacer version, run
+`brew upgrade displayplacer`". Re-checked at launch, when Settings opens, and before an apply if the cached path vanished.
+Never installs anything. Missing → Settings shows `displayplacer not found`, the install command
+`brew install displayplacer` with a Copy button, and a link to the project page.
+
+### 9.2 Parsing `displayplacer list` (v1.4.0)
+
+```
+Persistent screen id: <UUID>
+Contextual screen id: <Int>
+Serial screen id: s<Int>
+Type: <free text>                       e.g. "MacBook built in screen", "27 inch external screen"
+Resolution: <W>x<H>
+Hertz: <Int>
+Color Depth: <Int>
+Scaling: on|off
+Origin: (<x>,<y>)[ - main display]
+Rotation: <deg>[ - <hint text>]
+Enabled: true|false
+Resolutions for rotation <deg>:
+  mode <n>: res:<W>x<H> hz:<Int> color_depth:<Int>[ scaling:on][ <-- current mode]
+<blank>
+…next screen…
+Execute the command below to set your screens to the current arrangement. …
+<blank>
+displayplacer "id:<…> res:… hz:… color_depth:… enabled:true scaling:on origin:(x,y) degree:0" "id:…"
+```
+
+- **Authoritative configuration = the final `displayplacer "…" "…"` line.** It is exactly what displayplacer accepts,
+  including mirror sets (`id:A+B`) and disabled screens. Split with a quote-aware tokenizer.
+- Per-screen blocks provide metadata: persistent/contextual/serial ids, type, main flag, supported modes (for the
+  unsupported-resolution pre-check), enabled.
+- Parsing is label-based; unknown labels and unknown `key:value` tokens are kept (`extraArguments`) and re-emitted,
+  for forward compatibility.
+- Missing command line, no screens, or unparseable required token → `malformedListOutput` with a raw snippet in diagnostics.
+
+### 9.3 Screen spec model and command generation
+
+```swift
+struct ScreenSetting: Codable, Hashable, Sendable {
+    var displayIDs: [String]      // 1 id, or several for a mirror set (first = "optimize for")
+    var enabled: Bool
+    var resolution: Size?         // points, as displayplacer reports (nil when disabled)
+    var refreshRate: Int?         // hz
+    var colorDepth: Int?
+    var scaling: Bool?
+    var origin: Point?            // global coordinates, main display at (0,0), y grows downward
+    var rotation: Int?            // 0/90/180/270
+    var extraArguments: [String: String]
+}
+```
+
+- Emitted token order matches displayplacer's own: `id res hz color_depth enabled scaling origin degree` + extras.
+  Disabled screen → `id:<ids> enabled:false`.
+- At apply time ids are **re-resolved** to the currently connected displays (section 11.1), so the command uses the
+  current persistent ids even if macOS swapped them.
+- Arguments go to `Process.arguments` one element per screen. No shell, so paths with spaces are safe.
+- Character whitelist for every token (ids `[A-Za-z0-9-+]`, numbers, `(`, `)`, `,`, `x`, `:`). Anything else is rejected.
+  This protects the copyable raw command from injection via imported files.
+- **Raw command** (Show / Copy): `'<path>' "<spec>" "<spec>"`. Path single-quoted only when needed. Label says whether
+  ids were resolved against connected displays or are the saved ids (some displays not connected).
+
+### 9.4 Execution and outcome classification
+
+`DisplayplacerClient` implements `DisplayControl { listLayout(); apply(arguments:) }` returning
+`ProcessOutput { exitCode, stdout, stderr, duration, timedOut }`.
+
+| Observation | Classification | Retryable |
+|---|---|---|
+| exit 0 | success (then verify) | n/a |
+| exit ≠ 0, output contains `Unable to find screen` | `displayNotFound` | yes (display may be waking) |
+| exit ≠ 0, output mentions a missing resolution/mode | `unsupportedMode` | no |
+| exit ≠ 0, `Argument parsing error` | `invalidArguments` (bug or bad import) | no |
+| timeout | `timedOut` | yes (once) |
+| launch failure (ENOENT, permission) | `executableUnavailable` | no, re-run discovery |
+| other exit ≠ 0 | `failed(exitCode)` | yes |
+
+Exit code plus verification is the ground truth. Output text only refines the message.
+
+---
+
+## 10. Persistence model
+
+### 10.1 Locations
+
+- Profiles, rules, learned ports: `~/Library/Application Support/DisplayManager/layouts.json`
+  (pretty, sorted keys, ISO 8601 dates, atomic write after each change).
+- Preferences: `UserDefaults` (`autoApplyEnabled` = true, `reapplyAfterWake` = true, `settleDelaySeconds` = 2.0,
+  `displayplacerPathOverride`, `hasCompletedFirstLaunch`).
+- Launch at Login: not stored; always read from `SMAppService.mainApp.status`.
+- Backups: before a migration or a "Replace All" import → `layouts.backup-<timestamp>.json` (keep last 5).
+- Unreadable/invalid file at launch → moved to `layouts.corrupt-<timestamp>.json`, user alerted, app starts empty.
+  The original is never overwritten silently.
+
+### 10.2 Document format (also the import/export format)
+
+```json
+{
+  "version": 1,
+  "exportedBy": "DisplayManager 1.0.0",
+  "profiles": [{
+    "id": "UUID", "name": "Desk", "createdAt": "…", "updatedAt": "…",
+    "screens": [{ "displayIDs": ["1D8D03AE-…"], "enabled": true,
+                  "resolution": {"width": 3008, "height": 1692}, "refreshRate": 60, "colorDepth": 8,
+                  "scaling": true, "origin": {"x": 0, "y": 0}, "rotation": 0, "extraArguments": {} }],
+    "displays": [{ "persistentID": "1D8D03AE-…", "contextualID": 3, "serialID": "s19",
+                   "vendorID": 25001, "productID": 10145, "serialNumber": 19,
+                   "name": "Mi Monitor", "typeDescription": "27 inch external screen", "isBuiltIn": false,
+                   "bounds": {"x": 0, "y": 0, "width": 3008, "height": 1692},
+                   "connection": {"hostModel": "Mac16,8", "portType": "usbC", "portNumber": 3, "tunneled": false} }],
+    "shortcut": {"keyCode": 18, "modifiers": ["option", "command"], "displayString": "⌥⌘1"},
+    "sourceCommand": "displayplacer \"id:… …\" …"
+  }],
+  "rules": [{
+    "id": "UUID", "profileID": "UUID", "isEnabled": true,
+    "connectionRequirements": [{ "persistentID": "1D8D03AE-…",
+                                 "connection": {"hostModel": "Mac16,8", "portType": "usbC", "portNumber": 3, "tunneled": false} }],
+    "triggers": {"launch": true, "displayConnect": true, "wake": true}
+  }],
+  "knownPorts": [{ "connection": { … }, "name": "Desk Port" }]
+}
+```
+
+- Array order of `profiles` = user order (menu order and rule tie-break).
+- `displays` is metadata for matching and preview; `screens` is what gets applied.
+- Decoding: read `version` first. `> current` → refuse ("created by a newer version"). `< current` → step migrations
+  (`v1→v2…`). Unknown keys are ignored. Optional fields use `decodeIfPresent`.
+
+### 10.3 Import / export
+
+- Export all (Settings › Data, Manager toolbar menu) or selected profiles (sidebar context menu: includes their rules
+  and referenced known ports). Default file name `Display Layouts.json`.
+- Import: size limit 5 MB → decode → migrate → **validate everything before changing anything**:
+  names 1–100 chars; ≥1 screen; token whitelist; width/height 1…32768; hz 1…1000 or absent; colorDepth 1…32 or absent;
+  rotation ∈ {0,90,180,270}; origins within ±100000; exactly one enabled screen at (0,0); unique ids;
+  rules reference profiles in the same file; fingerprints well-formed.
+- Summary alert: "Import 3 layouts and 2 rules?" → **Add** (new UUIDs on id conflict, name suffix " 2" on name
+  conflict, imported rules on conflicting conditions arrive disabled) / **Replace All** (backup first) / Cancel.
+- Errors list the first 10 problems with profile names.
+
+---
+
+## 11. Active layout detection (normalization and comparison)
+
+### 11.1 Display identity resolution (`DisplayResolver`)
+
+Map each saved display to at most one live display (bijection), in this order:
+1. Same persistent UUID.
+2. Saved display is built-in → the single live built-in display.
+3. Same `(vendorID, productID, serialNumber)` with `serialNumber != 0`, unique on both sides.
+4. Otherwise unresolved.
+
+Also used to rebuild the apply command with current ids and to explain "different monitor connected".
+
+### 11.2 Normalized form
+
+Per screen group (single display or mirror set), keyed by the sorted set of resolved live persistent ids:
+`enabled`, and when enabled: `resolution`, `refreshRate`, `colorDepth`, `scaling`, `origin`, `rotation`.
+
+Ignored on purpose: contextual/serial ids, type text, mode numbers, names, argument order, `extraArguments`
+(e.g. `quiet:true`), supported mode lists.
+
+### 11.3 Comparison rules (deterministic, pure)
+
+| Field | Rule |
+|---|---|
+| Display set | Every enabled saved display must resolve and be online. Every online live display must belong to the profile. Extra or missing displays → mismatch |
+| Disabled in profile | Matches a live display that is disabled **or** absent |
+| Mirror sets | Compared as sets of ids |
+| Resolution | Exact |
+| Refresh rate | Exact integer. Ignored if either side is absent |
+| Color depth | Exact. Ignored if either side is absent |
+| Scaling | Exact |
+| Rotation | Exact |
+| Origin | Each axis within **±2 points** (macOS may nudge edges when snapping; 2 pt is visually immaterial) |
+| Main display | Implied by origin (0,0), so already covered |
+
+Result: `.match` or `.mismatch([Difference])` (differences drive verification messages and the Manager's
+"Differs from current" hint).
+
+Current layout = the **first profile in user order** that matches. None → `Custom`. displayplacer missing →
+`Unknown`. Menu shows a checkmark only on that profile.
+
+Apply verification uses the same comparator restricted to the profile's own displays (a profile that does not mention a
+connected display can apply successfully while the current layout still shows `Custom`; documented behavior).
+
+---
+
+## 12. Menu bar behavior
+
+### 12.1 Click handling
+
+```swift
+button.sendAction(on: [.leftMouseDown, .rightMouseDown])
+@objc func statusItemClicked(_ sender: NSStatusBarButton) {
+    let event = NSApp.currentEvent
+    let isSecondary = event?.type == .rightMouseDown
+        || (event?.type == .leftMouseDown && event?.modifierFlags.contains(.control) == true)
+    if isSecondary { systemSettingsOpener.openDisplays() }
+    else { statusItem.menu = menu; sender.performClick(nil) }   // menuDidClose → statusItem.menu = nil
+}
+```
+
+- The menu is attached only for the left-click tracking session, so right click never shows it and native
+  highlight/positioning is kept.
+- Control-click is treated like right click (macOS convention).
+- No event (VoiceOver press) → open the menu.
+
+### 12.2 Open System Settings › Displays (`SystemSettingsOpener`)
+
+1. `x-apple.systempreferences:com.apple.Displays-Settings.extension` (macOS 13+; id verified on 27).
+2. If `open` returns false: `x-apple.systempreferences:com.apple.preference.displays` (legacy id).
+3. Then `/System/Library/PreferencePanes/Displays.prefPane`.
+4. Then open System Settings app (`com.apple.systempreferences`).
+Each step logged. `NSWorkspace.open` can return true without landing on the right pane; that cannot be detected.
+
+### 12.3 Menu structure (rebuilt in `menuNeedsUpdate`, from cached state)
+
+```
+Current Layout: Desk                        (disabled label; "Custom", "Unknown", "Applying TV…")
+⚠ Couldn't apply TV – Details…              (only after a failure; opens details alert)
+──────────────
+Layouts                                     (section header)
+  ✓ Desk                          ⌥⌘1
+    TV                            ⌥⌘2
+    MacBook Only                            (disabled + tooltip when a required display is not connected)
+──────────────
+Save Current Layout…
+Layout Manager…
+──────────────
+Auto Apply                        ✓
+Reapply After Wake                ✓
+Launch at Login                   ✓        ("Launch at Login (Needs Approval)" when status = requiresApproval)
+──────────────
+Displays Settings…                          (same as right click; helps discoverability)
+Settings…                         ⌘,
+Quit DisplayManager               ⌘Q
+```
+
+- Profiles are top-level items (one click to apply) instead of an "Apply Layout ▸" submenu.
+- No layouts → disabled "No saved layouts" + Save item stays.
+- displayplacer missing → label `displayplacer not found`, item opens Settings › displayplacer; apply items disabled.
+- Status icon: `display` template; switches to `display.trianglebadge.exclamationmark` while an automatic apply failure
+  is unacknowledged (cleared when the user opens the details or a later apply succeeds).
+- Key equivalents on profile items are for display. Duplicate triggers (menu + Carbon hotkey) are deduplicated
+  (same profile within 1 s is ignored).
+
+---
+
+## 13. UI structure
+
+### 13.1 Save Current Layout…
+
+1. Activate app, capture snapshot. Failure → alert with reason.
+2. `NSAlert` "Save Current Layout": summary line per display
+   (`Mi Monitor – 3008 × 1692 @ 60 Hz – USB-C Port 3`), accessory: name field (suggestion "Layout N"),
+   checkbox "Apply automatically when connected like this" (off by default; creates a rule with the display set and
+   the currently identified ports).
+3. Empty name → Save disabled. Existing name → second alert "Replace 'Desk'?" (keeps id, rule, shortcut; replaces screens
+   and display metadata).
+4. Persist, refresh menu; the new profile becomes the current match.
+
+### 13.2 Layout Manager window
+
+`NavigationSplitView`, window ~900×600, frame autosave, reopening brings it to front.
+
+- **Sidebar**: "Current Displays" item; "Layouts" section with profiles (drag to reorder; active one marked with a
+  checkmark badge; context menu: Apply, Rename, Duplicate, Export…, Delete…). Toolbar: `+` (Save Current Layout…),
+  Import/Export menu.
+- **Current Displays** detail: live preview, per display: name, resolution, Hz, scaling, rotation, origin, main,
+  identity (persistent/serial ids, EDID vendor/product), connection (`USB-C Port 3 · Desk Port` or reason why unidentified),
+  current raw command, "Save as Layout…".
+- **Profile** detail:
+  - Header: inline editable name, "Active" badge, prominent **Apply Layout** button (disabled with reason if a required
+    display is missing), status of last apply.
+  - Preview (13.3).
+  - Displays list: per screen settings + connected/not connected state.
+  - **Auto Apply** section (rule editor, section 14.1).
+  - Keyboard shortcut: recorder + Clear.
+  - Advanced: "Show Raw Command" disclosure (monospaced, selectable), "Copy Raw Command", "Update From Current Layout…".
+  - Menu: Rename, Duplicate, Export…, Delete… (confirm; also removes rules and the hotkey).
+- Empty state: "No layouts yet" + Save Current Layout button. First launch (no layouts file) opens the Manager once.
+
+### 13.3 Layout preview (`LayoutPreviewView` + Core `PreviewGeometry`)
+
+- Rectangles from `origin` + size in points. Size from saved `bounds` metadata when present (handles rotation
+  correctly), else `resolution`, swapped for 90/270.
+- Union bounding box → uniform scale to fit with padding, preserving proportions and relative positions; y down.
+- Each rectangle: rounded, adaptive colors; label with name, `3008 × 1692`, `60 Hz`; main display gets a thin
+  menu-bar strip on top (like System Settings); rotation badge (`90°`); mirror set shows `Mirrored` + member names;
+  not-connected display drawn dashed with a warning glyph. Details hide progressively when the rectangle is small.
+- Disabled screens listed below the canvas as chips ("Disabled: Built-in Retina Display").
+- Accessibility label per display.
+
+### 13.4 Settings window (`NSTabViewController`, toolbar style)
+
+| Tab | Content |
+|---|---|
+| General | Launch at Login (with "Needs approval → Open Login Items" when required), Auto Apply, Reapply After Wake |
+| Automation | "Wait for displays after wake" (0–10 s, default 2), Learned Ports table (rename, delete; technical label shown), Recent Activity list, Copy Diagnostics |
+| displayplacer | Status (Installed / not found / unsupported version), path, version, Choose…, Reset, Re-check, install instructions |
+| Data | Import…, Export…, Show Data Folder in Finder |
+
+---
+
+## 14. Auto-apply logic
+
+### 14.1 Rule model and editor
+
+- One rule per profile in the UI (model allows more).
+- Implicit condition (always): the connected display set equals the profile's display set (11.3 display-set rule).
+  This is the "External monitor connected" condition and blocks another monitor on the same port from matching.
+- Optional per external display: "uses [Any port | Desk Port (USB-C Port 3) | …]" + **Learn Current Port**.
+  This is the "Matching physical connection detected" condition.
+- Triggers: App launch, Display connection, Wake from sleep (per rule). Effective trigger = global toggle AND rule toggle
+  (Auto Apply gates launch + connect; Reapply After Wake gates wake).
+- Conflict warning shown in the editor when another enabled rule has identical conditions.
+
+### 14.2 Rule matching (`RuleMatcher`, pure)
+
+```
+candidates = enabled rules whose trigger set contains the trigger
+           ∩ display-set condition holds against the snapshot
+           ∩ every connection requirement: resolved live display's fingerprint == required fingerprint
+             (unidentified port never satisfies a requirement)
+winner     = max(number of connection requirements)   // most specific wins
+             tie → earliest profile in user order
+```
+
+### 14.3 Decision and loop prevention (`AutomationPolicy`, pure)
+
+State: `lastStableSignature`, `lastAutoApply (signature, profileID, date)`, `recentAutoApplies [Date]`,
+`suppressUntil`, `preSleep (signature, matchedProfileID)`, `paused`.
+
+1. **Connect trigger fires only when the topology signature changed** since the last stable snapshot.
+   Mode/origin changes (the user editing Displays settings, or our own apply) never trigger auto-apply.
+2. **Self-induced changes**: events between apply start and apply end + 3 s are absorbed. The post-apply signature
+   becomes `lastStableSignature` without evaluating rules (covers `enabled:false` making a display go offline).
+3. **Already correct**: if the current layout already matches the target → no apply, just record.
+4. **Once per topology entry**: after an auto-apply for signature S, no further auto-apply for S until the signature
+   changes (unplug/replug resets it; wake re-evaluates, see 5).
+5. **Wake**: always re-evaluate the stable snapshot. Apply only if the target does not match the current layout.
+   Target = matching wake rule; if none and Reapply After Wake is on and the signature equals the pre-sleep signature →
+   the profile that matched before sleep.
+6. **Circuit breaker**: more than 3 automatic applies in 2 minutes → pause automation, show warning in menu, resume on the
+   next topology change after the pause window or when the user toggles Auto Apply.
+7. Session not active (fast user switching, login window) → skip; re-evaluate on `sessionDidBecomeActive` (as wake).
+
+---
+
+## 15. Display connect and wake handling (`AutomationCoordinator`)
+
+```
+CG reconfig callback ─┐   (flags: add/remove/enabled/disabled → topology; others → layout only)
+IOKit DP transport    ├─► mark dirty(reason) ─► restart debounce task (cancel previous)
+first-match/terminated┘
+NSWorkspace didWake / screensDidWake ─► reason = wake, extra initial delay = settleDelay (default 2 s)
+App launch ─► reason = launch (once)
+
+debounce: 1.0 s of quiet
+stability: capture signature every 0.75 s until 2 consecutive identical signatures, and every external display
+           is either port-identified or has no pending transport; max 8 s (connect/launch) or 15 s (wake)
+           timeout → log "displays not ready", refresh status only
+refresh AppModel.snapshot + current layout (always)
+decide via AutomationPolicy (section 14.3) → ApplyCoordinator.apply(profile, .automatic(reason))
+willSleep → cancel pending automation tasks, record preSleep state
+```
+
+- Nothing blocks the main thread; all waits are `Task.sleep` in cancellable tasks.
+- CG callbacks arrive in begin/end pairs; only end-of-configuration events count.
+
+---
+
+## 16. Apply pipeline (`Core.LayoutApplier` + `ApplyCoordinator`)
+
+```
+1. locate displayplacer                         (missing → executableUnavailable)
+2. capture snapshot                             (malformed → error)
+3. resolve profile displays → live displays     (missing enabled display → displayNotConnected;
+                                                 different external present → "Mi Monitor is not connected. Connected: Dell U2720Q")
+4. pre-check supported modes (same rotation)    (→ unsupportedMode, not retryable)
+5. current already matches?                     (→ alreadyApplied, no process run)
+6. run displayplacer with resolved arguments
+7. classify output (section 9.4)
+8. verify: wait 0.75 s, list again, compare (profile displays only); mismatch → re-check once after 1.5 s
+9. retry per policy or finish
+```
+
+| Policy | Attempts | Delays between attempts | Retries on |
+|---|---|---|---|
+| Automatic (connect/wake/launch) | 4 | 1.5 s, 3 s, 5 s | displayNotConnected (still waking), displayNotFound, verification mismatch, timeout (once), failed |
+| Manual (menu, hotkey, Manager) | 2 | 1.5 s | displayNotFound, verification mismatch, timeout |
+
+- Bounded: no infinite loops, total automatic time ≈ 10 s + process time.
+- Final failure → manual: `NSAlert` with message + "Show Details" (stdout/stderr, command, differences);
+  automatic: menu warning item + icon badge + diagnostics entry. No notification permission needed.
+- Every attempt logged (attempt n/N, reason, exit code, duration).
+
+---
+
+## 17. Launch at Login
+
+- `SMAppService.mainApp.register()` / `unregister()`; toggle state = `status == .enabled`
+  (`.requiresApproval` shown as on + "Needs Approval" with a button calling `openSystemSettingsLoginItems()`).
+- Status re-read on menu open, when Settings appears, and on `didBecomeActive`. Errors shown in an alert.
+- If the app is not running from `/Applications`, Settings shows a hint (registration is path-bound).
+- Not enabled automatically. Phase 2 verification will not toggle it (persistent system configuration); the user does.
+
+---
+
+## 18. Keyboard shortcuts
+
+Decision: **Carbon `RegisterEventHotKey`** (no Accessibility or Input Monitoring permission; the standard mechanism used by
+shortcut utilities). `NSEvent.addGlobalMonitorForEvents` needs Accessibility and cannot consume keys, so it is rejected.
+
+- Optional per profile, none by default. Stored as `keyCode` (layout-independent) + modifiers + display string.
+- Recorder: `NSViewRepresentable` field that captures `keyDown`/`flagsChanged` while focused; Esc cancels, Delete clears.
+  All hotkeys are temporarily unregistered while recording so an existing shortcut can be re-recorded.
+- Validation (`ShortcutValidator`, pure): must include ⌘, ⌥ or ⌃; not a duplicate of another profile.
+- Conflict checks before accepting:
+  1. `CopySymbolicHotKeys`: reject if it equals an enabled macOS system shortcut ("Used by macOS").
+  2. Probe with `kEventHotKeyExclusive`: `eventHotKeyExistsErr` → reject ("Used by another app"). On success, immediately
+     unregister and re-register **non-exclusive**, so we never block other apps.
+- Registered non-exclusively → we never override other apps' hotkeys.
+- Limitation: apps using event taps or non-Carbon mechanisms cannot be detected; if such an app uses the same combination,
+  both respond. The UI states this in one line. Probe semantics across processes come from header docs and are verified in
+  Phase 2; if the probe cannot detect other processes, only check 1 remains and this is documented.
+
+---
+
+## 19. Error handling
+
+| Case | Detection | User-facing result |
+|---|---|---|
+| displayplacer missing | locator | Menu label, Settings status with install instructions, apply/save disabled |
+| Unsupported displayplacer version | `--version` | Settings status "Update displayplacer" |
+| Malformed list output | parser | Alert "Couldn't read the current display configuration" + details |
+| Saved display not connected | resolver | Menu item disabled with tooltip; apply error names the missing display |
+| Monitor changed | resolver (different external present) | Error names expected and connected monitors |
+| Unsupported resolution | mode pre-check / output | "3008 × 1692 @ 60 Hz is not supported by Mi Monitor" (no retry) |
+| Apply failure | exit code / verification | Alert or menu warning with details |
+| Display still waking | stability timeout / displayNotFound | Automatic retries; final message "Displays were not ready" |
+| Topology detection failure | IOKit read failure / class missing | Ports show "Not available"; port rules cannot match; identity rules still work |
+| Connection not identifiable | join result | Rule editor explains why; Learn Current Port shows reason |
+| Import failure | decode/validate | Alert listing problems; nothing changed |
+| Persistence failure | write error | Alert; in-memory state kept; retry on next change |
+| Launch at Login failure | SMAppService error | Alert with system message; toggle reflects real status |
+| Hotkey unavailable | validation/registration | Inline message in recorder |
+
+All errors are `DisplayManagerError: LocalizedError` with `userMessage` + `diagnosticDetail`. No force unwraps on hardware
+or file data. Hardware changes never crash the app.
+
+---
+
+## 20. Logging and diagnostics
+
+- `os.Logger(subsystem: "com.bachana.DisplayManager", category:)` with categories:
+  `app`, `displays`, `topology`, `displayplacer`, `automation`, `apply`, `persistence`, `hotkeys`, `login`.
+- Logged (event-driven only, no polling, so no spam): display connected/disconnected, snapshot summary, topology
+  fingerprints, matched rule, apply attempt/retry/failure/success with duration, wake/sleep handling, circuit breaker.
+- Hardware identifiers logged with default (private) privacy; non-identifying values public.
+- `DiagnosticsLog` keeps the last 300 entries in memory for Settings › Automation › Recent Activity.
+- "Copy Diagnostics": app version, macOS version, host model, displayplacer path/version, current snapshot
+  (displays, ports, current command), last apply attempts with stdout/stderr, recent events.
+- README documents: `log stream --predicate 'subsystem == "com.bachana.DisplayManager"' --level info`.
+
+---
+
+## 21. Installation and build strategy
+
+### 21.1 `Scripts/build-app.sh [debug|release]`
+
+`set -euo pipefail`, resolves its own dir, selects toolchain (section 3), `swift build`, assembles bundle into
+`$DM_BUILD_DIR/dist/DisplayManager.app`, writes version (`CFBundleShortVersionString` from a `VERSION` variable,
+`CFBundleVersion` = UTC timestamp), `plutil -lint`, `codesign --force --sign - --options runtime`,
+`codesign --verify --strict --verbose=2`, prints the bundle path.
+
+### 21.2 `install.sh`
+
+```
+Usage: ./install.sh [--no-launch] [--help]
+```
+1. `set -euo pipefail`; resolve script dir with `cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P`.
+2. Verify macOS ≥ 14, `codesign`, `plutil`, `ditto` exist, and a working Swift toolchain (Xcode or CLT). If none:
+   print `xcode-select --install` (or "accept the Xcode license") and exit 1. Never runs `sudo`.
+3. Check displayplacer (PATH, `/opt/homebrew/bin`, `/usr/local/bin`). Missing → clear warning + `brew install displayplacer`;
+   installation continues (the app reports the missing dependency). Never installs Homebrew or displayplacer.
+4. Build Release via `Scripts/build-app.sh release`.
+5. If DisplayManager is running, quit it (`pkill -x DisplayManager`, wait up to 5 s). State is saved on every change, so
+   nothing is lost.
+6. Replace safely: `ditto` into `/Applications/.DisplayManager.app.installing`, verify signature there, remove the old
+   `/Applications/DisplayManager.app`, `mv` the new one into place. Executable permissions preserved by `ditto`.
+   `/Applications` not writable → clear error (no sudo).
+7. Verify installed bundle: executable bit, `codesign --verify`, Info.plist bundle id.
+8. Print final location; launch with `open` unless `--no-launch`.
+
+Ad-hoc signing notes (README): locally built apps carry no quarantine attribute, so Gatekeeper does not block them.
+Copying the app to another Mac via download adds quarantine → right-click › Open once. After a reinstall, macOS may treat
+the new ad-hoc signature as a new app for Login Items; if the toggle shows off, enable it again.
+
+---
+
+## 22. Testing strategy
+
+### 22.1 Unit tests (Swift Testing, `swift test`, hostless, no hardware)
+
+| Area | Cases |
+|---|---|
+| ScreenSpecCodec | full spec, negative origins, mirror `A+B`, `enabled:false` only, unknown tokens kept, whitespace, round trip |
+| ListOutputParser | real fixture (2 displays), main-display suffix, rotation hint suffix, "current mode" marker, synthetic mirrored/disabled/clamshell/3-display fixtures, missing command line, garbage input |
+| CommandBuilder | argv exactness, id re-resolution, disabled screens, whitelist rejection, raw-command quoting with spaces in path |
+| ExecutableLocator | order, override, PATH parsing, non-executable skipped, version parsing and minimum check |
+| ApplyOutcome | classification table in 9.4 |
+| EDID | vendor PNP decode ("XMI"), product 10145, serial 19, name descriptor "Mi Monitor", bad header/short data → nil |
+| SnapshotAssembler | join by EDID triple, builtin, no transport, ambiguous identical monitors, HDMI inactive node ignored, tunneled flag, fallback property derivation |
+| ConnectionFingerprint | key format, equality, host model difference, labels |
+| DisplayResolver | UUID, builtin fallback, serial fallback, serial 0 not used, bijection |
+| LayoutComparator | identical, origin tolerance ±2 boundary, res/hz/scaling/rotation diffs, extra/missing display, disabled vs absent, mirror order, depth ignored when absent, differences list |
+| RuleMatcher | display set, port requirement, other monitor on same port rejected, specificity, tie by order, disabled rules, trigger filter, unidentified port |
+| AutomationPolicy | connect only on signature change, self-induced suppression, already-correct no-op, once per topology entry, replug re-applies, wake re-evaluation and pre-sleep fallback, circuit breaker, inactive session |
+| LayoutApplier (fake DisplayControl + instant Sleeper) | success, verification retry, bounded attempts, non-retryable stop, already-applied short-circuit, missing display waits |
+| LayoutDocument | round trip, newer version refused, unknown keys ignored, migration hook, corrupt data |
+| ImportValidator | each validation rule, Add merge (id/name conflicts, disabled conflicting rules), Replace |
+| ShortcutValidator, PreviewGeometry | modifiers required, duplicates; fit/scale math, rotation swap, negative origins |
+
+Fixtures from this Mac use anonymized ids. Synthetic fixtures are labeled as synthetic in their file header.
+
+### 22.2 Build and static validation
+
+- `swift build -c release -Xswiftc -warnings-as-errors` (Swift 6 strict concurrency).
+- `swift test`.
+- `plutil -lint` on the assembled Info.plist; `codesign --verify --strict`.
+- `bash -n install.sh Scripts/build-app.sh` (no shellcheck installed).
+
+### 22.3 Phase 2 on-machine verification (safe)
+
+- Run `install.sh`, confirm `/Applications/DisplayManager.app` exists, is signed, launches (`pgrep -x DisplayManager`).
+- Check logs / Copy Diagnostics output: expect Mi Monitor identified as `USB-C Port 3`.
+- Only a **same-layout** apply may be exercised (expected result `alreadyApplied`, no visible change). Switching to a
+  different layout, Launch at Login and port moves are left to the user's manual QA.
+
+### 22.4 Manual QA (user)
+
+Left click menu / right click Displays / ctrl-click; save layout; apply between two different layouts; rename, duplicate,
+delete, reorder; preview accuracy; Learn Current Port on two different ports; unplug/replug → auto-apply once; same monitor
+on another port → other layout; different monitor on the learned port → no apply; sleep/wake reapply; Launch at Login
+toggle and reboot; shortcuts incl. conflict messages; import/export round trip and invalid file; displayplacer missing
+(temporary path override to a non-existent file).
+
+---
+
+## 23. Phase 2 execution order
+
+1. Scaffold: `Package.swift`, `.gitignore`, `Packaging/Info.plist`, `Scripts/build-app.sh`; confirm CLT build works.
+2. Core models, ScreenSpecCodec, ListOutputParser, CommandBuilder, ExecutableLocator + tests.
+3. EDID, PortTransportRecord, SnapshotAssembler, DisplayResolver, LayoutComparator, RuleMatcher + tests.
+4. AutomationPolicy, LayoutApplier, LayoutDocument, ImportValidator, ShortcutValidator, PreviewGeometry + tests.
+5. System adapters: DisplayplacerClient, CGDisplayReader, PortTopologyReader, SnapshotService, DiagnosticsLog.
+6. AppModel, ProfileStore, Preferences, StatusItemController/menu, SystemSettingsOpener, MainMenu.
+7. Save flow, ApplyCoordinator, Layout Manager (list, detail, preview, current displays, raw command).
+8. Rule editor + Learn Current Port + known ports; AutomationCoordinator + DisplayEventMonitor.
+9. Settings window, LoginItemController, import/export.
+10. HotKeyCenter + recorder.
+11. App icon, accessibility labels, empty states, README.
+12. `install.sh`; full verification (22.2, 22.3); final report.
+
+---
+
+## 24. Known limitations and risks
+
+| # | Risk / limitation | Type | Mitigation |
+|---|---|---|---|
+| 1 | Port detection uses IORegistry classes/properties (`IOPortTransportStateDisplayPort`, `ParentBuiltInPortNumber`, …) that are readable with public IOKit APIs but are **not a documented contract**. They can change in a future macOS | Fact | Fallback derivation chain (8.1), graceful "Not available", diagnostics |
+| 2 | Verified only on this Mac (M4 Pro, macOS 27), direct USB-C DP Alt Mode. Thunderbolt docks (tunneled DP), MST/daisy chains, HDMI with a connected display, Intel Macs, macOS 14/15 not verified | Fact | Defensive handling (8.4); identity-only rules keep working |
+| 3 | macOS gives receptacle numbers, not physical positions. The app cannot say "left/right" | Fact | Custom port names |
+| 4 | Persistent UUID staying identical across ports is expected but not verified here (would need a cable move) | Uncertain | Resolver falls back to EDID serial; ids re-resolved at apply time |
+| 5 | Two identical monitors with identical EDID serials cannot be told apart for port mapping | Fact | Marked ambiguous; port rules for them never match |
+| 6 | displayplacer uses private CoreGraphics APIs; a macOS update can break it. Parser targets the v1.4.0 format. `enabled:false` may require a replug to re-enable. Rotating the built-in display can crash (displayplacer warns) | Fact | Version check, clear errors, verification after apply |
+| 7 | Rotated-display size semantics in displayplacer `res` not verified | Uncertain | Preview uses saved CG bounds |
+| 8 | Carbon hotkeys are a legacy (but supported) API; conflict detection is partial | Fact + inference | Non-exclusive registration, system shortcut check, exclusive probe (verified in Phase 2) |
+| 9 | Ad-hoc signing: Login Items may need re-enabling after a reinstall; distribution to other Macs needs right-click › Open | Inference | Documented; toggle always shows real status |
+| 10 | Xcode license not accepted: build depends on Command Line Tools Swift ≥ 6.0 | Fact | install.sh detects toolchain and explains the fix |
+| 11 | Repo lives in iCloud Drive. "Optimize Mac Storage" can evict source files and break builds | Fact | Build dir outside iCloud; README note (`brctl download` or keep files local) |
+| 12 | Displays deep link is undocumented; `NSWorkspace.open` may return true without reaching the pane | Fact | 4-step fallback chain; verified id exists on macOS 27 |
+| 13 | Temporary `statusItem.menu` + `performClick` pattern relies on AppKit behavior, not a documented left/right API | Common practice | Isolated in StatusItemController; fallback `menu.popUp(positioning:at:in:)` |
+| 14 | Debounce/settle timings are heuristics; slow monitors may need more time | Inference | Wake delay setting; bounded retries |
+| 15 | Clamshell and mirroring follow displayplacer semantics; tested with synthetic fixtures only | Fact | Unit tests + manual QA |
+
+---
+
+## 25. Assumptions to confirm (change any before Phase 2 if needed)
+
+1. Product name **DisplayManager**, bundle id **com.bachana.DisplayManager**.
+2. Minimum macOS **14.0**.
+3. **SwiftPM + Command Line Tools** build instead of an Xcode project (no Xcode license needed).
+4. Auto Apply and Reapply After Wake default **on**, Launch at Login default **off**.
+5. Profiles listed **directly in the menu** (one click) instead of an "Apply Layout" submenu.
+6. Control-click behaves like right-click.
+7. No git repository will be initialized unless requested (only `.gitignore` is added).
+
+---
+
+## 26. Deviations log (Phase 2)
+
+Small adjustments made during Phase 2. No requirement was dropped.
+
+| # | Area (plan section) | Change | Reason |
+|---|---|---|---|
+| 1 | Toolchain (3) | Scripts share `Scripts/toolchain.sh` (selection) and `Scripts/swift.sh` (wrapper for `swift build/test` with the build dir outside iCloud). `xcrun swift` is used first; CLT is the fallback | The Xcode license is accepted on this Mac now, so `xcrun` works. The CLT fallback stays for Macs without Xcode |
+| 2 | Toolchain (3) | When the CLT has stale `*.private.swiftinterface` files for PackageDescription, the script builds a symlink mirror without them inside the build dir and sets `SWIFTPM_CUSTOM_LIBS_DIR` | The CLT on this Mac failed to link `Package.swift` ("Undefined symbols … Package.__allocating_init"). No files outside the build dir are touched |
+| 3 | Package (3, 5) | `swift-tools-version: 6.0` with `swiftLanguageModes: [.v6]` | Swift 6 strict concurrency for the whole package, as planned |
+| 4 | App icon (3) | `Scripts/generate-icon.swift` renders every iconset size itself, `Scripts/generate-icon.sh` runs it and `iconutil`. No `sips` step | Rendering each size directly is sharper than downscaling and needs one tool less |
+| 5 | displayplacer (9) | `ProcessRunner` runs displayplacer with a fixed minimal environment (`PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `LANG`) | Predictable output; no user shell configuration involved |
+| 6 | displayplacer (9, 20) | displayplacer status is logged only when it changes | Re-checks on every Settings open and menu refresh produced repeated identical log lines |
+| 7 | Persistence (10) | Loading `layouts.json` decodes the document without the stricter import validation | The app's own file must always load; an unreadable file is still moved aside |
+| 8 | Port detection (8) | "Not available" is decided by checking for the base transport class when no DisplayPort transport records exist | An empty result on a supported Mac (no external display) must not look like "unsupported" |
+| 9 | Automation (15) | Topology events that arrive while an apply is running are not evaluated | The apply's own result updates the snapshot and the policy, so half-applied states are never evaluated |
+| 10 | Hotkeys (18) | Probe semantics verified on macOS 27: the exclusive probe detects shortcuts another app registered exclusively; non-exclusive registrations and event taps cannot be detected. Recording suspends all hotkeys and resumes them when recording ends | Required by 18; the UI states the limitation in one line |
+| 11 | Menu (12.3) | Explicit "Automation paused after repeated applies – Resume" item; "Launch at Login (Needs Approval)" opens Login Items | Makes the paused state and the approval step actionable from the menu |
+| 12 | Profiles (13.2) | Duplicate copies screens and display metadata only, not the Auto Apply rule or the shortcut | A copy with the same rule would conflict with the original; shortcuts must be unique |
+| 13 | Save flow (13.1) | After saving with "Apply automatically…", an info alert names any rule with the same conditions | Conflicts would otherwise only be visible in the rule editor |
+| 14 | Settings (13.4) | Fixed size per tab; General also shows the version; Data shows counts and the file path | Stable window layout with the toolbar tab style |
+| 15 | App lifecycle | Reopening the app (Finder, Spotlight, `open`) shows the Layout Manager | A menu bar app otherwise gives no feedback when opened again |
+| 16 | Installer (21.2) | Running copies are found with `pgrep -x` and filtered by executable path, then SIGTERM, wait 5 s, SIGKILL. The old app is moved to `.DisplayManager.app.previous` and restored if the swap fails. Extra checks: directories owned by another user in the old bundle, and iCloud-evicted source files | Safer than `pkill -x` (never touches another app with the same name) and never leaves `/Applications` without an app |
+| 17 | Build (21.1) | Ad-hoc signing adds `--timestamp=none` | No timestamp server is used for ad-hoc signatures |
+| 18 | Text | A shared `counted(_:_:)` helper gives "1 layout" / "2 layouts" in alerts, Settings and log messages | Replaces "layout(s)" wording |
+| 19 | Menu bar (12), logging (20) | The status item logs once after launch whether it is visible, with a hint about a full menu bar or System Settings › Menu Bar › Allow in the Menu Bar | On macOS 27 status item windows are hosted remotely and do not appear in `CGWindowList` (verified with a minimal probe app), so visibility can only be checked in-process |

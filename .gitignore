@@ -1,0 +1,17 @@
+# SwiftPM build output. The scripts build outside the project; this covers a bare `swift build`.
+.build/
+.build.nosync/
+.swiftpm/
+dist/
+
+# Xcode, if the package is opened there
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# Icon generation intermediate
+Packaging/AppIcon.iconset/
+
+# macOS and iCloud Drive
+.DS_Store
+*.icloud

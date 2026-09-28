@@ -1,0 +1,19 @@
+# SYNTHETIC fixture (hand-written, not captured from hardware): lid closed, only the external display is listed.
+Persistent screen id: BBBBBBBB-5555-6666-7777-888888888888
+Contextual screen id: 3
+Serial screen id: s2000000002
+Type: 27 inch external screen
+Resolution: 3008x1692
+Hertz: 60
+Color Depth: 8
+Scaling: on
+Origin: (0,0) - main display
+Rotation: 0
+Enabled: true
+Resolutions for rotation 0:
+  mode 78: res:3008x1692 hz:60 color_depth:8 scaling:on <-- current mode
+  mode 79: res:3008x1692 hz:60 color_depth:8
+
+Execute the command below to set your screens to the current arrangement. If screen ids are switching, please run `displayplacer --help` for info on using contextual or serial ids instead of persistent ids.
+
+displayplacer "id:BBBBBBBB-5555-6666-7777-888888888888 res:3008x1692 hz:60 color_depth:8 enabled:true scaling:on origin:(0,0) degree:0"

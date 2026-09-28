@@ -1,0 +1,111 @@
+{
+  "version": 1,
+  "exportedBy": "DisplayManager 1.0.0",
+  "futureTopLevelKey": "ignored by version 1 readers",
+  "profiles": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "name": "Desk",
+      "createdAt": "2026-09-01T10:00:00Z",
+      "updatedAt": "2026-09-02T10:00:00.500Z",
+      "screens": [
+        {
+          "displayIDs": ["BBBBBBBB-5555-6666-7777-888888888888"],
+          "enabled": true,
+          "resolution": {"width": 3008, "height": 1692},
+          "refreshRate": 60,
+          "colorDepth": 8,
+          "scaling": true,
+          "origin": {"x": 0, "y": 0},
+          "rotation": 0,
+          "extraArguments": {}
+        },
+        {
+          "displayIDs": ["AAAAAAAA-1111-2222-3333-444444444444"],
+          "enabled": true,
+          "resolution": {"width": 1512, "height": 982},
+          "refreshRate": 120,
+          "colorDepth": 8,
+          "scaling": true,
+          "origin": {"x": 3008, "y": 608},
+          "rotation": 0
+        }
+      ],
+      "displays": [
+        {
+          "persistentID": "BBBBBBBB-5555-6666-7777-888888888888",
+          "contextualID": 3,
+          "serialID": "s2000000002",
+          "vendorID": 25001,
+          "productID": 10145,
+          "serialNumber": 2000000002,
+          "name": "Mi Monitor",
+          "typeDescription": "27 inch external screen",
+          "isBuiltIn": false,
+          "bounds": {"x": 0, "y": 0, "width": 3008, "height": 1692},
+          "connection": {"hostModel": "Mac16,8", "portType": "usbC", "portNumber": 3, "tunneled": false},
+          "futureDisplayKey": true
+        },
+        {
+          "persistentID": "AAAAAAAA-1111-2222-3333-444444444444",
+          "contextualID": 1,
+          "serialID": "s1000000001",
+          "vendorID": 1552,
+          "productID": 41057,
+          "serialNumber": 1000000001,
+          "name": "Built-in Retina Display",
+          "typeDescription": "MacBook built in screen",
+          "isBuiltIn": true,
+          "bounds": {"x": 3008, "y": 608, "width": 1512, "height": 982}
+        }
+      ],
+      "shortcut": {"keyCode": 18, "modifiers": ["option", "command"], "displayString": "⌥⌘1"},
+      "sourceCommand": "displayplacer \"id:BBBBBBBB-5555-6666-7777-888888888888 res:3008x1692 hz:60 color_depth:8 enabled:true scaling:on origin:(0,0) degree:0\" \"id:AAAAAAAA-1111-2222-3333-444444444444 res:1512x982 hz:120 color_depth:8 enabled:true scaling:on origin:(3008,608) degree:0\""
+    },
+    {
+      "id": "22222222-2222-4222-8222-222222222222",
+      "name": "MacBook Only",
+      "createdAt": "2026-09-03T10:00:00Z",
+      "updatedAt": "2026-09-03T10:00:00Z",
+      "screens": [
+        {
+          "displayIDs": ["AAAAAAAA-1111-2222-3333-444444444444"],
+          "enabled": true,
+          "resolution": {"width": 1800, "height": 1169},
+          "refreshRate": 120,
+          "colorDepth": 8,
+          "scaling": true,
+          "origin": {"x": 0, "y": 0},
+          "rotation": 0
+        }
+      ],
+      "displays": [
+        {
+          "persistentID": "AAAAAAAA-1111-2222-3333-444444444444",
+          "name": "Built-in Retina Display",
+          "isBuiltIn": true
+        }
+      ]
+    }
+  ],
+  "rules": [
+    {
+      "id": "33333333-3333-4333-8333-333333333333",
+      "profileID": "11111111-1111-4111-8111-111111111111",
+      "isEnabled": true,
+      "connectionRequirements": [
+        {
+          "persistentID": "BBBBBBBB-5555-6666-7777-888888888888",
+          "connection": {"hostModel": "Mac16,8", "portType": "usbC", "portNumber": 3, "tunneled": false}
+        }
+      ],
+      "triggers": {"launch": true, "displayConnect": true, "wake": true}
+    }
+  ],
+  "knownPorts": [
+    {
+      "connection": {"hostModel": "Mac16,8", "portType": "usbC", "portNumber": 3, "tunneled": false},
+      "name": "Desk Port"
+    }
+  ]
+}

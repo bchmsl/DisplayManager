@@ -1,0 +1,34 @@
+# SYNTHETIC fixture (hand-written, not captured from hardware): built-in display mirrored to an external display.
+Persistent screen id: AAAAAAAA-1111-2222-3333-444444444444
+Contextual screen id: 1
+Serial screen id: s1000000001
+Type: MacBook built in screen
+Resolution: 1920x1080
+Hertz: 60
+Color Depth: 8
+Scaling: on
+Origin: (0,0) - main display
+Rotation: 0
+Enabled: true
+Resolutions for rotation 0:
+  mode 0: res:1920x1080 hz:60 color_depth:8 scaling:on <-- current mode
+  mode 1: res:1512x982 hz:120 color_depth:8 scaling:on
+
+Persistent screen id: BBBBBBBB-5555-6666-7777-888888888888
+Contextual screen id: 3
+Serial screen id: s2000000002
+Type: 27 inch external screen
+Resolution: 1920x1080
+Hertz: 60
+Color Depth: 8
+Scaling: on
+Origin: (0,0)
+Rotation: 0
+Enabled: true
+Resolutions for rotation 0:
+  mode 0: res:1920x1080 hz:60 color_depth:8 scaling:on <-- current mode
+  mode 1: res:3008x1692 hz:60 color_depth:8 scaling:on
+
+Execute the command below to set your screens to the current arrangement. If screen ids are switching, please run `displayplacer --help` for info on using contextual or serial ids instead of persistent ids.
+
+displayplacer "id:BBBBBBBB-5555-6666-7777-888888888888+AAAAAAAA-1111-2222-3333-444444444444 res:1920x1080 hz:60 color_depth:8 enabled:true scaling:on origin:(0,0) degree:0"
