@@ -24,9 +24,23 @@ if ! dm_select_toolchain; then
     dm_print_toolchain_help
     exit 1
 fi
+if [[ -n "$DM_TOOLCHAIN_NOTE" ]]; then
+    echo "==> Note: $DM_TOOLCHAIN_NOTE" >&2
+fi
 mkdir -p "$BUILD_DIR"
 dm_prepare_package_api_libs "$BUILD_DIR" >&2
 
 subcommand="$1"
 shift
-exec "$DM_SWIFT" "$subcommand" --package-path "$ROOT_DIR" --scratch-path "$BUILD_DIR/swiftpm" "$@"
+extra=()
+case "$subcommand" in
+    build|test)
+        # SwiftPM from the Command Line Tools does not load Swift Testing's macro plugin by itself
+        # ("plugin for module 'TestingMacros' not found"). Xcode does, so it gets no extra flags.
+        testing_plugins="$(dirname "$DM_SWIFT")/../lib/swift/host/plugins/testing"
+        if [[ "$DM_DEVELOPER_DIR" -ef "$DM_CLT_DIR" && -e "$testing_plugins/libTestingMacros.dylib" ]]; then
+            extra=(-Xswiftc -plugin-path -Xswiftc "$testing_plugins")
+        fi
+        ;;
+esac
+exec "$DM_SWIFT" "$subcommand" --package-path "$ROOT_DIR" --scratch-path "$BUILD_DIR/swiftpm" ${extra[@]+"${extra[@]}"} "$@"

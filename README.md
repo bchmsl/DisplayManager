@@ -23,7 +23,8 @@ configuration. DisplayManager never installs anything by itself.
 
 - macOS 14 Sonoma or newer. Built and tested on macOS 27 on an Apple silicon Mac.
 - displayplacer 1.4.0 or newer.
-- To build: Xcode or the Command Line Tools with Swift 6.0 or newer.
+- To build: Xcode (recommended) or the Command Line Tools, with Swift 6.0 or newer. With only the Command Line
+  Tools on the macOS 27 SDK, the build uses their previous macOS SDK (see [Build from source](#build-from-source)).
 
 ### Install displayplacer
 
@@ -55,7 +56,8 @@ Options:
 
 What the installer does:
 
-1. Checks macOS version, `codesign`, `plutil`, `ditto`, `pgrep` and a working Swift toolchain.
+1. Checks macOS version, `codesign`, `plutil`, `ditto`, `pgrep`, and a Swift toolchain and macOS SDK that can build
+   the app (see [Build from source](#build-from-source)).
 2. Checks that no source files are evicted by iCloud Drive (see [iCloud Drive](#icloud-drive)).
 3. Checks that `/Applications` is writable. If it is not, it stops with an explanation.
 4. Checks for displayplacer. If it is missing, it prints the Homebrew command and continues.
@@ -277,8 +279,17 @@ rm -rf ~/Library/Caches/DisplayManager-build
 
 ## Build from source
 
-The project is a Swift package (Swift 6 language mode, strict concurrency). `Scripts/swift.sh` selects a working
-toolchain (Xcode first, then the Command Line Tools) and keeps build products outside the source folder.
+The project is a Swift package (Swift 6 language mode, strict concurrency). The scripts keep build products outside
+the source folder and choose a toolchain for their own process only. They never run `xcode-select` or change system
+settings. They try, in order:
+
+1. the active developer directory (`DEVELOPER_DIR` or `xcode-select -p`);
+2. an Xcode in `/Applications` or `~/Applications`, even when it is not selected;
+3. the Command Line Tools.
+
+On the macOS 27 SDK, SwiftUI's `@State` is a macro whose plugin ships only with Xcode. When a toolchain cannot build
+SwiftUI with its default SDK, the scripts use its previous macOS SDK instead and print a note. The Command Line Tools
+install the current and the previous SDK. If nothing works, the scripts list what they checked and how to fix it.
 
 | Task | Command |
 |---|---|

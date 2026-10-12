@@ -65,6 +65,10 @@ if ! dm_select_toolchain; then
     exit 1
 fi
 echo "    Swift: $DM_SWIFT_VERSION"
+echo "    SDK: macOS $DM_SDK_VERSION ($DM_DEVELOPER_DIR)"
+if [[ -n "$DM_TOOLCHAIN_NOTE" ]]; then
+    echo "    Note: $DM_TOOLCHAIN_NOTE"
+fi
 
 # iCloud Drive can keep files only in the cloud ("Optimize Mac Storage"); the build needs them locally.
 evicted="$(find "$ROOT_DIR/Sources" "$ROOT_DIR/Packaging" "$ROOT_DIR/Scripts" -name '.*.icloud' -print -quit 2>/dev/null || true)"

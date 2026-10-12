@@ -47,7 +47,10 @@ if ! dm_select_toolchain; then
     dm_print_toolchain_help
     exit 1
 fi
-echo "==> Using $DM_SWIFT_VERSION"
+echo "==> Using $DM_SWIFT_VERSION, macOS $DM_SDK_VERSION SDK"
+if [[ -n "$DM_TOOLCHAIN_NOTE" ]]; then
+    echo "==> Note: $DM_TOOLCHAIN_NOTE"
+fi
 mkdir -p "$BUILD_DIR"
 dm_prepare_package_api_libs "$BUILD_DIR"
 
