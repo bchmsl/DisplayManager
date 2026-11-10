@@ -1,9 +1,11 @@
 # DisplayManager: Implementation Plan
 
-Status: Phase 1 (planning) complete. Phase 2 starts only after the explicit instruction `Execute the plan`.
+Status: Phase 1 (planning) and Phase 2 (implementation) are complete. Version 1.0.0 was built and installed to
+`/Applications/DisplayManager.app` on 2026-10-12. The code is in the GitHub repository `bchmsl/DisplayManager`.
 
-This file is the source of truth for Phase 2. If implementation proves an assumption wrong, make the
-smallest reasonable adjustment and record it in section 26 ("Deviations log").
+This file is the design source of truth. Sections 1 to 25 are the original plan, with "Later:" notes where facts
+changed. If an implementation choice differs from the plan, make the smallest reasonable adjustment and record it
+in section 26 ("Deviations log").
 
 ---
 
@@ -13,13 +15,13 @@ smallest reasonable adjustment and record it in section 26 ("Deviations log").
 |---|---|
 | Hardware | MacBook Pro, Mac16,8, Apple M4 Pro, arm64 |
 | macOS | 27.0 (26A428) |
-| Xcode | 27.0 installed, **license not accepted**, so `xcodebuild` and the `/usr/bin/swift` shim fail |
+| Xcode | 27.0 installed, **license not accepted**, so `xcodebuild` and the `/usr/bin/swift` shim fail. Later: license accepted, `xcrun swift` works (section 26 #1) |
 | Command Line Tools | `/Library/Developer/CommandLineTools`, Swift 6.4, **works without the Xcode license**, ships `Testing.framework` (Swift Testing) |
 | SDKs | MacOSX27.0.sdk (Xcode and CLT) |
 | displayplacer | v1.4.0 at `/opt/homebrew/bin/displayplacer` (symlink into Cellar). Not in `/usr/local/bin` |
 | `displayplacer list` | ~60 ms. Output format v1.4.0 (sample in section 9.2) |
 | displayplacer errors | Unknown screen id: exit 1, stderr/stdout `Unable to find screen <id> - skipping changes for that screen` (printed several times). Bad syntax: exit 1, `Argument parsing error`. Probed only with an all-zero dummy id, so no display state changed |
-| Repo | Empty directory, not a git repository, located inside iCloud Drive |
+| Repo | Empty directory, not a git repository, located inside iCloud Drive. Later: git repository `bchmsl/DisplayManager`, still inside iCloud Drive |
 | Linters | No `shellcheck`, `swiftlint`, `swift-format` installed |
 | Connected now | Built-in display (main) + external "Mi Monitor" (EDID manufacturer `XMI`) via USB-C |
 
@@ -930,7 +932,7 @@ toggle and reboot; shortcuts incl. conflict messages; import/export round trip a
 | 7 | Rotated-display size semantics in displayplacer `res` not verified | Uncertain | Preview uses saved CG bounds |
 | 8 | Carbon hotkeys are a legacy (but supported) API; conflict detection is partial | Fact + inference | Non-exclusive registration, system shortcut check, exclusive probe (verified in Phase 2) |
 | 9 | Ad-hoc signing: Login Items may need re-enabling after a reinstall; distribution to other Macs needs right-click › Open | Inference | Documented; toggle always shows real status |
-| 10 | Xcode license not accepted: build depends on Command Line Tools Swift ≥ 6.0 | Fact | install.sh detects toolchain and explains the fix |
+| 10 | The build needs a Swift 6 toolchain. Xcode works. With only the Command Line Tools on the macOS 27 SDK, SwiftUI's `@State` macro plugin is missing, so the build uses the previous macOS SDK (section 26 #20, #21) | Fact | Scripts choose the toolchain and SDK for their own process only and explain the fix when nothing works |
 | 11 | Repo lives in iCloud Drive. "Optimize Mac Storage" can evict source files and break builds | Fact | Build dir outside iCloud; README note (`brctl download` or keep files local) |
 | 12 | Displays deep link is undocumented; `NSWorkspace.open` may return true without reaching the pane | Fact | 4-step fallback chain; verified id exists on macOS 27 |
 | 13 | Temporary `statusItem.menu` + `performClick` pattern relies on AppKit behavior, not a documented left/right API | Common practice | Isolated in StatusItemController; fallback `menu.popUp(positioning:at:in:)` |
@@ -939,15 +941,17 @@ toggle and reboot; shortcuts incl. conflict messages; import/export round trip a
 
 ---
 
-## 25. Assumptions to confirm (change any before Phase 2 if needed)
+## 25. Assumptions made before Phase 2
 
 1. Product name **DisplayManager**, bundle id **com.bachana.DisplayManager**.
 2. Minimum macOS **14.0**.
 3. **SwiftPM + Command Line Tools** build instead of an Xcode project (no Xcode license needed).
+   Later: SwiftPM kept. The scripts try Xcode first and fall back to the Command Line Tools (section 26 #1, #20).
 4. Auto Apply and Reapply After Wake default **on**, Launch at Login default **off**.
 5. Profiles listed **directly in the menu** (one click) instead of an "Apply Layout" submenu.
 6. Control-click behaves like right-click.
 7. No git repository will be initialized unless requested (only `.gitignore` is added).
+   Later: the folder is now the git repository `bchmsl/DisplayManager`.
 
 ---
 
